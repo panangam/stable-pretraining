@@ -1,0 +1,121 @@
+"""Point-JEPA point-cloud primitives and latent-prediction contracts."""
+
+import io
+import zipfile
+
+import numpy as np
+import torch
+
+from stable_pretraining.backbone.point_cloud import (
+    PointJEPAMasking,
+    PointSequencer,
+    PointTokenizer,
+)
+from stable_pretraining.methods.point_jepa import PointJEPA
+from stable_pretraining.data.point_cloud import PointCloudTransform, ShapeNet55
+
+
+def test_tokenizer_and_sequencer():
+    """Grouping is local and ordered token gradients reach PointNet."""
+    tokenizer = PointTokenizer(num_groups=8, group_size=6, embed_dim=24)
+    points = torch.randn(2, 32, 3)
+    groups, centers = tokenizer.group(points)
+    assert groups.shape == (2, 8, 6, 3)
+    assert torch.allclose(groups.norm(dim=-1).min(-1).values, torch.zeros(2, 8))
+    tokens, centers = tokenizer(points)
+    tokens.retain_grad()
+    ordered, ordered_centers = PointSequencer()(tokens, centers)
+    assert ordered.shape == (2, 8, 24)
+    assert torch.equal(
+        ordered_centers[:, 0], centers[torch.arange(2), centers.sum(-1).argmin(-1)]
+    )
+    assert torch.allclose(
+        torch.sort(ordered_centers, dim=1).values, torch.sort(centers, dim=1).values
+    )
+    ordered.sum().backward()
+    assert tokenizer.pointnet_local_mlp[0].weight.grad is not None
+
+
+def test_pointnet_patch_permutation_and_legacy_weights(monkeypatch):
+    """Mini PointNet pooling ignores point order and restores existing weights."""
+    tokenizer = PointTokenizer(num_groups=2, group_size=6, embed_dim=24).eval()
+    groups = torch.randn(2, 2, 6, 3)
+    centers = torch.randn(2, 2, 3)
+    monkeypatch.setattr(tokenizer, "group", lambda points: (groups, centers))
+    tokens, _ = tokenizer(torch.empty(0))
+    permutation = torch.randperm(6)
+    monkeypatch.setattr(
+        tokenizer, "group", lambda points: (groups[:, :, permutation], centers)
+    )
+    permuted_tokens, _ = tokenizer(torch.empty(0))
+    torch.testing.assert_close(tokens, permuted_tokens)
+    legacy_state = {
+        key.replace("pointnet_local_mlp.", "first.").replace(
+            "pointnet_fusion_mlp.", "second."
+        ): value
+        for key, value in tokenizer.state_dict().items()
+    }
+    restored = PointTokenizer(num_groups=2, group_size=6, embed_dim=24).eval()
+    restored.load_state_dict(legacy_state, strict=True)
+    for key, value in tokenizer.state_dict().items():
+        torch.testing.assert_close(value, restored.state_dict()[key])
+
+
+def test_masking_excludes_targets():
+    """Four target blocks are contiguous and none is visible in context."""
+    torch.manual_seed(7)
+    masking = PointJEPAMasking()
+    for _ in range(20):
+        mask = masking(64, torch.device("cpu"))
+        assert mask.target_idx.shape[0] == 4
+        assert 9 <= mask.target_idx.shape[1] <= 12
+        assert torch.all(mask.target_idx[:, 1:] - mask.target_idx[:, :-1] == 1)
+        assert not torch.isin(mask.context_idx, mask.target_idx).any()
+        remaining = 64 - mask.target_idx.unique().numel()
+        assert int(remaining * 0.40) <= len(mask.context_idx) <= int(remaining * 0.75)
+
+
+def test_point_jepa_forward_backward():
+    """Student, tokenizer, and predictor train while the teacher stays frozen."""
+    model = PointJEPA(
+        num_groups=8,
+        group_size=8,
+        embed_dim=48,
+        encoder_depth=2,
+        encoder_heads=3,
+        predictor_dim=24,
+        predictor_depth=1,
+        predictor_heads=3,
+    )
+    output = model({"points": torch.randn(2, 64, 3)}, "fit")
+    assert output["predictions"].shape == output["targets"].shape
+    assert torch.isfinite(output["loss"])
+    output["loss"].backward()
+    assert model.tokenizer.pointnet_local_mlp[0].weight.grad is not None
+    assert model.encoder.student.blocks[0].attn.qkv.weight.grad is not None
+    assert model.predictor.output_proj.weight.grad is not None
+    assert all(
+        parameter.grad is None for parameter in model.encoder.teacher.parameters()
+    )
+    model.eval()
+    assert model({"points": torch.randn(2, 64, 3)}, "test")["embedding"].shape == (
+        2,
+        96,
+    )
+
+
+def test_shapenet_split_uses_official_npy_names(tmp_path):
+    """Official split lines include .npy and select objects from the ZIP."""
+    archive = tmp_path / "ShapeNet55.zip"
+    payload = io.BytesIO()
+    np.save(payload, np.random.randn(64, 3).astype("float32"))
+    with zipfile.ZipFile(archive, "w") as handle:
+        handle.writestr("ShapeNet55/shapenet_pc/object-a.npy", payload.getvalue())
+        handle.writestr("ShapeNet55/shapenet_pc/object-b.npy", payload.getvalue())
+    split = tmp_path / "train.txt"
+    split.write_text("object-a.npy\n")
+    dataset = ShapeNet55(
+        archive, split_file=split, transform=PointCloudTransform(32, False)
+    )
+    assert len(dataset) == 1
+    assert dataset[0]["points"].shape == (32, 3)

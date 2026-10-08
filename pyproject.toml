@@ -90,6 +90,7 @@ write_to = "stable_pretraining/_version.py"
 write_to_template = "version = \"{version}\"\n"
 
 [project.optional-dependencies]
+point-cloud = ["h5py", "viser"]
 # JAX / Flax-NNX backend (parallel to the default torch/Lightning one). Kept
 # optional so ``import stable_pretraining`` and the torch path never pull in
 # jax. Install with ``pip install -e ".[jax]"`` (CPU) or pick a CUDA jaxlib
