@@ -63,22 +63,24 @@ def point_jepa(self, batch: dict[str, Any], stage: str) -> dict[str, torch.Tenso
     import torch.nn.functional as F
 
     tokens, centers = self.tokenizer(batch["points"])
-    tokens, centers = self.sequencer(tokens, centers)
     if stage not in ("fit", "validate"):
-        encoded = self.encoder.forward_student(tokens, centers)
+        encoded = self.encoder.forward_student(tokens, self.encoder_position(centers))
         return {
             "embedding": torch.cat([encoded.max(1).values, encoded.mean(1)], dim=-1),
             "token_embedding": encoded,
             "loss": encoded.new_zeros(()),
         }
 
+    tokens, centers = self.sequencer(tokens, centers)
     mask = self.masking(tokens.shape[1], tokens.device)
     context = self.encoder.forward_student(
-        tokens[:, mask.context_idx], centers[:, mask.context_idx]
+        tokens[:, mask.context_idx], self.encoder_position(centers[:, mask.context_idx])
     )
     self.encoder.teacher.eval()
     with torch.no_grad():
-        teacher = self.encoder.forward_teacher(tokens.detach(), centers)
+        teacher = self.encoder.forward_teacher(
+            tokens.detach(), self.encoder_position(centers), normalize=False
+        )
         teacher = F.layer_norm(teacher, (teacher.shape[-1],))
         targets = teacher[:, mask.target_idx]
     batch_size, _, length, width = targets.shape
@@ -99,10 +101,8 @@ def point_jepa(self, batch: dict[str, Any], stage: str) -> dict[str, torch.Tenso
         dim=1,
     )
     loss = F.smooth_l1_loss(predictions, targets, beta=2.0)
-    predictor_std = (
-        predictions.detach().reshape(-1, width).std(dim=0, unbiased=False).mean()
-    )
-    target_std = targets.detach().reshape(-1, width).std(dim=0, unbiased=False).mean()
+    predictor_std = predictions.detach().reshape(-1, width).std(dim=0).mean()
+    target_std = targets.detach().reshape(-1, width).std(dim=0).mean()
     if self._trainer is not None:
         prefix = "train" if stage == "fit" else "val"
         self.log(f"{prefix}/loss", loss, on_step=True, on_epoch=True, sync_dist=True)

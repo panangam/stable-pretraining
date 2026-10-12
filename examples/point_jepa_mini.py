@@ -8,14 +8,15 @@ import torch
 from torch.utils.data import DataLoader
 
 import stable_pretraining as spt
-from stable_pretraining.data.point_cloud import PointCloudTransform, ShapeNet55
 
 
 def main() -> None:
     """Run a bounded mixed-precision ShapeNet55 fit and save a checkpoint."""
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--archive", type=Path, default=Path("POINT_JEPA_DEV/data/ShapeNet55.zip")
+        "--archive",
+        type=Path,
+        default=Path("POINT_JEPA_DEV/data/ShapeNet55.zip"),
     )
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -33,10 +34,9 @@ def main() -> None:
         parser.error(
             "--full requires the official ShapeNet55 train split via --split-file"
         )
-    dataset = ShapeNet55(
+    dataset = spt.data.ShapeNet55(
         args.archive,
         split_file=args.split_file,
-        transform=PointCloudTransform(),
         limit=None if args.full else args.limit,
     )
     loader = DataLoader(
@@ -46,6 +46,7 @@ def main() -> None:
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=args.full,
+        collate_fn=spt.data.PointCloudTransform().collate,
     )
     model = spt.PointJEPA(
         accumulate_steps=args.accumulate_steps,
@@ -66,6 +67,7 @@ def main() -> None:
         accelerator="gpu",
         devices=1,
         precision="16-mixed",
+        sync_batchnorm=True,
         max_epochs=500 if args.full else None,
         max_steps=-1 if args.full else args.steps,
         callbacks=[spt.TeacherStudentCallback()],

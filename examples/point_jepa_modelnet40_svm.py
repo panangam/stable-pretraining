@@ -5,16 +5,15 @@ from pathlib import Path
 
 import numpy as np
 import torch
+
+import stable_pretraining as spt
 from sklearn.svm import SVC
 from torch.utils.data import DataLoader
-
-from stable_pretraining.data.point_cloud import ModelNet40H5, PointCloudTransform
-from stable_pretraining.methods.point_jepa import PointJEPA
 
 
 @torch.no_grad()
 def features(
-    model: PointJEPA, loader: DataLoader, device: torch.device
+    model: spt.PointJEPA, loader: DataLoader, device: torch.device
 ) -> tuple[np.ndarray, np.ndarray]:
     """Extract pooled student features and labels from a ModelNet40 split."""
     embeddings, labels = [], []
@@ -35,7 +34,7 @@ def main() -> None:
     args = parser.parse_args()
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     parameters = checkpoint["hyper_parameters"]
-    model = PointJEPA(
+    model = spt.PointJEPA(
         **{
             key: parameters[key]
             for key in (
@@ -58,13 +57,16 @@ def main() -> None:
     model.load_state_dict(checkpoint["state_dict"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
-    transform = PointCloudTransform(training=False)
+    transform = spt.data.PointCloudTransform(training=False)
     train = DataLoader(
-        ModelNet40H5(args.root, "train", transform=transform),
+        spt.data.ModelNet40H5(args.root, "train"),
         batch_size=args.batch_size,
+        collate_fn=transform.collate,
     )
     test = DataLoader(
-        ModelNet40H5(args.root, "test", transform=transform), batch_size=args.batch_size
+        spt.data.ModelNet40H5(args.root, "test"),
+        batch_size=args.batch_size,
+        collate_fn=transform.collate,
     )
     x_train, y_train = features(model, train, device)
     x_test, y_test = features(model, test, device)

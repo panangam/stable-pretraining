@@ -12,6 +12,10 @@ from stable_pretraining.backbone.point_cloud import (
     PointTokenizer,
 )
 from stable_pretraining.methods.point_jepa import PointJEPA
+from stable_pretraining.methods.point_jepa import (
+    _PointJEPAEMA,
+    _reference_lr_multiplier,
+)
 from stable_pretraining.data.point_cloud import PointCloudTransform, ShapeNet55
 
 
@@ -36,8 +40,8 @@ def test_tokenizer_and_sequencer():
     assert tokenizer.pointnet_local_mlp[0].weight.grad is not None
 
 
-def test_pointnet_patch_permutation_and_legacy_weights(monkeypatch):
-    """Mini PointNet pooling ignores point order and restores existing weights."""
+def test_pointnet_patch_permutation(monkeypatch):
+    """Mini PointNet pooling ignores point order."""
     tokenizer = PointTokenizer(num_groups=2, group_size=6, embed_dim=24).eval()
     groups = torch.randn(2, 2, 6, 3)
     centers = torch.randn(2, 2, 3)
@@ -49,16 +53,6 @@ def test_pointnet_patch_permutation_and_legacy_weights(monkeypatch):
     )
     permuted_tokens, _ = tokenizer(torch.empty(0))
     torch.testing.assert_close(tokens, permuted_tokens)
-    legacy_state = {
-        key.replace("pointnet_local_mlp.", "first.").replace(
-            "pointnet_fusion_mlp.", "second."
-        ): value
-        for key, value in tokenizer.state_dict().items()
-    }
-    restored = PointTokenizer(num_groups=2, group_size=6, embed_dim=24).eval()
-    restored.load_state_dict(legacy_state, strict=True)
-    for key, value in tokenizer.state_dict().items():
-        torch.testing.assert_close(value, restored.state_dict()[key])
 
 
 def test_masking_excludes_targets():
@@ -87,8 +81,17 @@ def test_point_jepa_forward_backward():
         predictor_depth=1,
         predictor_heads=3,
     )
-    masks, predictor_inputs, student_inputs, teacher_inputs = [], [], [], []
+    masks, predictor_inputs, student_inputs, teacher_inputs, sequences = (
+        [],
+        [],
+        [],
+        [],
+        [],
+    )
     handles = [
+        model.sequencer.register_forward_hook(
+            lambda module, args, output: sequences.append(output)
+        ),
         model.masking.register_forward_hook(
             lambda module, args, output: masks.append(output)
         ),
@@ -122,7 +125,7 @@ def test_point_jepa_forward_backward():
         assert inputs["query_mask"].all()
         torch.testing.assert_close(
             inputs["query_pos"],
-            model.predictor_position(teacher_inputs[0][1][:, target_idx]),
+            model.predictor_position(sequences[0][1][:, target_idx]),
         )
     assert output["predictions"].shape == output["targets"].shape
     assert torch.isfinite(output["loss"])
@@ -130,6 +133,15 @@ def test_point_jepa_forward_backward():
     assert model.tokenizer.pointnet_local_mlp[0].weight.grad is not None
     assert model.encoder.student.blocks[0].attn.qkv.weight.grad is not None
     assert model.predictor.output_proj.weight.grad is not None
+    assert model.encoder_position[0].weight.grad is not None
+    assert not hasattr(model.encoder.student, "position")
+    assert not hasattr(model.encoder.teacher, "position")
+    with torch.no_grad():
+        raw_teacher = model.encoder.forward_teacher(*teacher_inputs[0], normalize=False)
+        expected_targets = torch.nn.functional.layer_norm(raw_teacher, (48,))[
+            :, mask.target_idx
+        ]
+    torch.testing.assert_close(output["targets"], expected_targets)
     assert all(
         parameter.grad is None for parameter in model.encoder.teacher.parameters()
     )
@@ -155,3 +167,65 @@ def test_shapenet_split_uses_official_npy_names(tmp_path):
     )
     assert len(dataset) == 1
     assert dataset[0]["points"].shape == (32, 3)
+
+
+def test_reference_ema_updates_and_resume():
+    """Initial copies and subsequent linear EMA survive state restoration."""
+    student = torch.nn.Linear(3, 4)
+    wrapper = _PointJEPAEMA(student, 0.9995, 0.99999)
+    wrapper.ema_total_updates.fill_(10)
+    for _ in range(2):
+        with torch.no_grad():
+            student.weight.add_(1)
+        wrapper.update_ema_coefficient(0, 500)
+        wrapper.update_teacher()
+        torch.testing.assert_close(wrapper.teacher.weight, student.weight)
+    previous = wrapper.teacher.weight.detach().clone()
+    with torch.no_grad():
+        student.weight.add_(1)
+    coefficient = 0.9995 + (0.99999 - 0.9995) * 2 / 10
+    wrapper.update_ema_coefficient(0, 500)
+    wrapper.update_teacher()
+    torch.testing.assert_close(
+        wrapper.teacher.weight,
+        previous * coefficient + student.weight * (1 - coefficient),
+    )
+    restored = _PointJEPAEMA(torch.nn.Linear(3, 4), 0.9995, 0.99999)
+    restored.load_state_dict(wrapper.state_dict())
+    assert restored.ema_updates.item() == 3
+    assert restored.ema_total_updates.item() == 10
+    restored.update_ema_coefficient(400, 500)
+    assert (
+        abs(restored.ema_coefficient.item() - (0.9995 + (0.99999 - 0.9995) * 3 / 10))
+        < 1e-7
+    )
+
+
+def test_reference_lr_epoch_boundaries():
+    """Manual optimizer updates preserve the reference's epoch LR values."""
+    settings = dict(updates_per_epoch=5, max_epochs=500, warmup_epochs=30, base_lr=1e-3)
+    for step in range(5):
+        assert abs(1e-3 * _reference_lr_multiplier(step, **settings) - 1e-5) < 1e-12
+    for epoch, lr in ((29, 1e-3), (30, 1e-3), (500, 1e-6)):
+        assert abs(1e-3 * _reference_lr_multiplier(epoch * 5, **settings) - lr) < 1e-12
+
+
+def test_batched_point_transform_fps_and_shared_augmentation():
+    """FPS selects input points and identical clouds share batch augmentation."""
+    cloud = torch.randn(128, 3)
+    repeated = torch.stack([cloud, cloud])
+    torch.manual_seed(7)
+    batch = PointCloudTransform(128).collate([{"points": cloud}, {"points": cloud}])
+    torch.testing.assert_close(batch["points"][0], batch["points"][1])
+    torch.testing.assert_close(
+        batch["points"].mean(1), torch.zeros(2, 3), atol=1e-6, rtol=0
+    )
+    torch.testing.assert_close(
+        batch["points"].norm(dim=-1).max(1).values, torch.ones(2)
+    )
+    from stable_pretraining._point_cloud import farthest_point_indices
+
+    indices = farthest_point_indices(repeated, 32)
+    assert indices.shape == (2, 32)
+    assert indices[0].unique().numel() == 32
+    assert indices[1].unique().numel() == 32

@@ -9,6 +9,8 @@ import numpy as np
 import torch
 
 from .datasets import Dataset
+from .._point_cloud import farthest_point_indices
+from torch.utils.data import default_collate
 
 
 class PointCloudTransform:
@@ -27,33 +29,52 @@ class PointCloudTransform:
         """Preprocess a point-cloud sample.
 
         Args:
-            sample: Dictionary containing XYZ ``points``.
+            sample: Dictionary containing XYZ ``points`` [N,3] or [B,N,3].
 
         Returns:
             Sample with normalized ``points`` [num_points,3].
         """
         points = sample["points"]
+        single_cloud = points.ndim == 2
+        if single_cloud:
+            points = points.unsqueeze(0)
+        if points.shape[1] < self.num_points:
+            raise ValueError("Too few points for the requested FPS subsampling")
+        if points.shape[1] > self.num_points:
+            indices = farthest_point_indices(points.float(), self.num_points)
+            points = points[
+                torch.arange(len(points), device=points.device)[:, None], indices
+            ]
         if self.training:
-            indices = torch.randperm(len(points))[: self.num_points]
-            scale = torch.empty(2).uniform_(0.8, 1.2)
-            points = points[indices] * torch.stack([scale[0], torch.ones(()), scale[1]])
-        else:
-            points = points[: self.num_points]
-        points = points - points.mean(0, keepdim=True)
-        points = points / points.norm(dim=-1).max().clamp_min(1e-8)
+            scale = torch.empty(3, device=points.device).uniform_(0.8, 1.2)
+            points = points * scale
+        points = points - points.mean(1, keepdim=True)
+        points = points / points.norm(dim=-1).max(1, keepdim=True).values.unsqueeze(-1)
         if self.training:
-            angle = torch.rand(()) * (2 * torch.pi)
+            angle = torch.rand((), device=points.device) * (2 * torch.pi) - torch.pi
             c, s = torch.cos(angle), torch.sin(angle)
+            zero, one = torch.zeros_like(c), torch.ones_like(c)
             rotation = torch.stack(
                 [
-                    torch.stack([c, torch.zeros_like(c), s]),
-                    torch.tensor([0.0, 1.0, 0.0]),
-                    torch.stack([-s, torch.zeros_like(c), c]),
+                    torch.stack([c, zero, s]),
+                    torch.stack([zero, one, zero]),
+                    torch.stack([-s, zero, c]),
                 ]
             )
-            points = points @ rotation
-        sample["points"] = points
+            points = points @ rotation.T
+        sample["points"] = points[0] if single_cloud else points
         return sample
+
+    def collate(self, samples: list[dict]) -> dict:
+        """Collate then transform so scaling and rotation are shared by a batch.
+
+        Args:
+            samples: Dataset samples with equally sized clouds.
+
+        Returns:
+            Collated dictionary with FPS-subsampled and normalized XYZ clouds.
+        """
+        return self(default_collate(samples))
 
 
 class ShapeNet55(Dataset):

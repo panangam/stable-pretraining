@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from .vit import TransformerBlock
+from .._point_cloud import farthest_point_indices
 
 
 class PointTokenizer(nn.Module):
@@ -32,42 +33,16 @@ class PointTokenizer(nn.Module):
         self.num_groups = num_groups
         self.group_size = group_size
         self.pointnet_local_mlp = nn.Sequential(
-            nn.Conv1d(3, 128, 1), nn.BatchNorm1d(128), nn.ReLU(), nn.Conv1d(128, 256, 1)
+            nn.Conv1d(3, 128, 1, bias=False),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Conv1d(128, 256, 1),
         )
         self.pointnet_fusion_mlp = nn.Sequential(
-            nn.Conv1d(512, 512, 1),
+            nn.Conv1d(512, 512, 1, bias=False),
             nn.BatchNorm1d(512),
             nn.ReLU(),
             nn.Conv1d(512, embed_dim, 1),
-        )
-
-    def _load_from_state_dict(
-        self,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,
-    ) -> None:
-        # The existing mini-run checkpoint predates the descriptive MLP names.
-        for old_name, new_name in (
-            ("first", "pointnet_local_mlp"),
-            ("second", "pointnet_fusion_mlp"),
-        ):
-            for key in list(state_dict):
-                if key.startswith(prefix + old_name + "."):
-                    new_key = prefix + new_name + key[len(prefix + old_name) :]
-                    state_dict[new_key] = state_dict.pop(key)
-        super()._load_from_state_dict(
-            state_dict,
-            prefix,
-            local_metadata,
-            strict,
-            missing_keys,
-            unexpected_keys,
-            error_msgs,
         )
 
     @torch.no_grad()
@@ -80,20 +55,9 @@ class PointTokenizer(nn.Module):
         Returns:
             Relative groups [B,G,K,3] and centers [B,G,3].
         """
-        batch, count, _ = points.shape
-        distances = torch.full((batch, count), float("inf"), device=points.device)
-        farthest = points.square().sum(-1).argmax(-1)
-        centers_idx = torch.empty(
-            batch, self.num_groups, dtype=torch.long, device=points.device
-        )
+        batch = points.shape[0]
+        centers_idx = farthest_point_indices(points.float(), self.num_groups)
         rows = torch.arange(batch, device=points.device)
-        for index in range(self.num_groups):
-            centers_idx[:, index] = farthest
-            center = points[rows, farthest]
-            distances = torch.minimum(
-                distances, (points - center[:, None]).square().sum(-1)
-            )
-            farthest = distances.argmax(-1)
         centers = points[rows[:, None], centers_idx]
         nearest = (
             torch.cdist(centers, points).topk(self.group_size, largest=False).indices
@@ -116,7 +80,7 @@ class PointTokenizer(nn.Module):
         local_features = self.pointnet_local_mlp(x)
         patch_features = local_features.max(-1, keepdim=True).values
         fused_features = torch.cat(
-            [local_features, patch_features.expand_as(local_features)], dim=1
+            [patch_features.expand_as(local_features), local_features], dim=1
         )
         point_features = self.pointnet_fusion_mlp(fused_features)
         patch_tokens = point_features.max(-1).values
@@ -197,7 +161,7 @@ class PointJEPAMasking(nn.Module):
             Context indices [C] and target indices [num_targets,T].
         """
         ratio = torch.empty(()).uniform_(*self.target_scale).item()
-        length = max(1, min(num_tokens - 1, int(num_tokens * ratio)))
+        length = max(1, int(num_tokens * ratio))
         starts = torch.randint(
             num_tokens - length + 1, (self.num_targets,), device=device
         )
@@ -233,9 +197,6 @@ class PointTokenTransformer(nn.Module):
         attn_dropout: float = 0.05,
     ) -> None:
         super().__init__()
-        self.position = nn.Sequential(
-            nn.Linear(3, 128), nn.GELU(), nn.Linear(128, embed_dim)
-        )
         self.blocks = nn.ModuleList(
             TransformerBlock(
                 dim=embed_dim,
@@ -249,17 +210,19 @@ class PointTokenTransformer(nn.Module):
         )
         self.norm = nn.LayerNorm(embed_dim)
 
-    def forward(self, tokens: torch.Tensor, centers: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, tokens: torch.Tensor, positions: torch.Tensor, *, normalize: bool = True
+    ) -> torch.Tensor:
         """Encode point-patch tokens with XYZ positional embeddings.
 
         Args:
             tokens: Point-patch tokens [B,G,D].
-            centers: Patch centers [B,G,3].
+            positions: Shared XYZ position embeddings [B,G,D].
+            normalize: Apply learned output LayerNorm; disable for teacher targets.
 
         Returns:
             Encoded patch tokens [B,G,D].
         """
-        positions = self.position(centers)
         for block in self.blocks:
             tokens = block(tokens + positions)
-        return self.norm(tokens)
+        return self.norm(tokens) if normalize else tokens

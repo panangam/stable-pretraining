@@ -1,4 +1,5 @@
 from .convmixer import ConvMixer
+from .._point_cloud import farthest_point_indices
 from .point_cloud import (
     PointJEPAMasking,
     PointJEPAMaskOutput,
@@ -106,6 +107,7 @@ __all__ = [
     PointJEPAMaskOutput,
     PointTokenTransformer,
     vit_hf,
+    farthest_point_indices,
     MultiHeadAttentiveProbe,
     LinearProbe,
     AutoLinearClassifier,

@@ -4,7 +4,7 @@
 
 The teacher encodes all patch tokens, while the student encodes only selected context tokens outside the union of targets. Each of the four target blocks is predicted in a separate predictor call using student context features and learned mask tokens with target XYZ positions; queries from different blocks do not attend to each other. Target blocks share a sampled length within each batch, have independent start positions, and may overlap. Predictions are compared with the teacher's encoded target features using Smooth-L1 with beta 2. Downstream evaluation uses all student tokens and concatenates their max and mean pools.
 
-The shared target length matches the official implementation. See [the reference comparison](point_jepa_reference_comparison.md) for verified matches, SPT integration changes, and remaining numerical differences, including encoder position ownership, teacher target normalization, preprocessing, and EMA scheduling. This implementation is not yet numerically equivalent to the released code.
+The shared target length matches the official implementation. See [the reference comparison](point_jepa_reference_comparison.md) for verified matches, SPT integration changes, and the numerical corrections and remaining runtime adaptations. Shared encoder positions, teacher normalization, random-start FPS, PointNet details, predictor regularization, and linear EMA now follow the released code. Full-training accuracy and bit-for-bit equivalence have not been established.
 
 ## Short ShapeNet smoke run
 
@@ -24,7 +24,7 @@ Download the official `train.txt` split from the [Point-JEPA metadata](https://g
 UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python examples/point_jepa_mini.py --full --split-file train.txt --archive POINT_JEPA_DEV/data/ShapeNet55.zip --batch-size 16 --accumulate-steps 32 --num-workers 8
 ```
 
-This selects the 500 epoch released configuration: AdamW at 1e-3 with weight decay 0.05, a 30/500 linear warmup from 1e-5, cosine decay to 1e-6, and EMA 0.9995 to 0.99999. The supplement describes a different EMA range of roughly 0.995 to 1.0. The full path uses `spt.Manager`; it was not run during the short smoke validation.
+This selects the 500 epoch released configuration: AdamW at 1e-3 with weight decay 0.05, a 30-epoch linear warmup from 1e-5, epoch-based cosine decay to 1e-6, and a linear EMA ramp from 0.9995 to 0.99999. SPT optimizer-update ticks are mapped to epoch LR values while its teacher callback uses the reference update-based EMA schedule. The supplement describes a different EMA range of roughly 0.995 to 1.0. The full path uses `spt.Manager`; it was not run during the short smoke validation.
 
 ## Frozen ModelNet40 linear evaluation
 
@@ -34,7 +34,7 @@ Install the optional HDF5 dependency with `pip install -e '.[point-cloud]'` and 
 UV_CACHE_DIR=/tmp/uv-cache uv run --no-sync python examples/point_jepa_modelnet40_svm.py data/modelnet40_ply_hdf5_2048 POINT_JEPA_DEV/mini_run.ckpt
 ```
 
-The two-step smoke checkpoint is only for validating the pipeline and cannot establish representation quality. ModelNet40 data is not bundled with this repository.
+The two-step smoke checkpoint is only for validating the pipeline and cannot establish representation quality. ModelNet40 data is not distributed with the library.
 
 ## Interactive latent PCA viewer
 

@@ -5,6 +5,7 @@ import math
 
 import torch
 from torch import nn
+from timm.layers import DropPath
 
 from stable_pretraining import Module
 from stable_pretraining.backbone import FlexibleTransformer, TeacherStudentWrapper
@@ -15,6 +16,57 @@ from stable_pretraining.backbone.point_cloud import (
     PointTokenTransformer,
 )
 from stable_pretraining.forward import point_jepa
+
+
+class _PointJEPAEMA(TeacherStudentWrapper):
+    """Reference linear EMA schedule driven by the SPT teacher callback."""
+
+    def __init__(self, student: nn.Module, start: float, end: float) -> None:
+        super().__init__(
+            student,
+            warm_init=False,
+            base_ema_coefficient=start,
+            final_ema_coefficient=end,
+        )
+        self.register_buffer("ema_updates", torch.zeros((), dtype=torch.long))
+        self.register_buffer("ema_total_updates", torch.ones((), dtype=torch.long))
+
+    @torch.no_grad()
+    def update_ema_coefficient(self, epoch: int, total_epochs: int) -> None:
+        """Use optimizer-update progress instead of the generic epoch cosine."""
+        progress = min(self.ema_updates.item() / self.ema_total_updates.item(), 1.0)
+        coefficient = self.base_ema_coefficient + progress * (
+            self.final_ema_coefficient - self.base_ema_coefficient
+        )
+        self.ema_coefficient.copy_(coefficient if self.ema_updates.item() else 0.0)
+
+    @torch.no_grad()
+    def update_teacher(self) -> None:
+        """Reproduce the reference's first update and initialization copies."""
+        if not self.training:
+            return
+        if self.ema_updates.item() < 2:
+            self.teacher.load_state_dict(self.student.state_dict())
+        super().update_teacher()
+        self.ema_updates.add_(1)
+
+
+def _reference_lr_multiplier(
+    step: int,
+    *,
+    updates_per_epoch: int,
+    max_epochs: int,
+    warmup_epochs: int,
+    base_lr: float,
+) -> float:
+    """Express the reference's epoch warmup/cosine in SPT update units."""
+    epoch = step // updates_per_epoch
+    if epoch < warmup_epochs:
+        return 1e-5 / base_lr + (1 - 1e-5 / base_lr) * epoch / max(warmup_epochs - 1, 1)
+    progress = (epoch - warmup_epochs) / (max_epochs - warmup_epochs)
+    return (
+        1e-6 / base_lr + (1 - 1e-6 / base_lr) * (1 + math.cos(math.pi * progress)) / 2
+    )
 
 
 class PointJEPA(Module):
@@ -63,10 +115,9 @@ class PointJEPA(Module):
             tokenizer=PointTokenizer(num_groups, group_size, embed_dim),
             sequencer=PointSequencer(),
             masking=PointJEPAMasking(),
-            encoder=TeacherStudentWrapper(
-                encoder,
-                base_ema_coefficient=ema_decay_start,
-                final_ema_coefficient=ema_decay_end,
+            encoder=_PointJEPAEMA(encoder, ema_decay_start, ema_decay_end),
+            encoder_position=nn.Sequential(
+                nn.Linear(3, 128), nn.GELU(), nn.Linear(128, embed_dim)
             ),
             predictor_position=nn.Sequential(
                 nn.Linear(3, 128), nn.GELU(), nn.Linear(128, predictor_dim)
@@ -112,9 +163,14 @@ class PointJEPA(Module):
                 "accumulate_steps": accumulate_steps,
             },
         )
+        # The reference predictor uses constant drop path and a zero mask token.
+        nn.init.zeros_(self.predictor.mask_token)
+        for block in self.predictor.blocks:
+            block.drop_path1 = DropPath(0.25)
+            block.drop_path2 = DropPath(0.25)
 
     def configure_optimizers(self) -> tuple[list[torch.optim.Optimizer], list[dict]]:
-        """Use the released 30/500 warmup fraction and cosine LR schedule.
+        """Use reference linear EMA and epoch warmup/cosine through SPT.
 
         Returns:
             SPT optimizer and scheduler configurations.
@@ -124,13 +180,21 @@ class PointJEPA(Module):
             steps = math.ceil(
                 self.trainer.estimated_stepping_batches / self.hparams.accumulate_steps
             )
-        self.optim["scheduler"] = {
-            "type": "LinearWarmupCosineAnnealingLR",
-            "warmup_steps": 0
-            if steps == 1
-            else max(1, min(steps - 1, round(steps * 30 / 500))),
-            "max_steps": steps,
-            "warmup_start_lr": 1e-5,
-            "eta_min": 1e-6,
-        }
+        self.encoder.ema_total_updates.fill_(steps)
+        epochs = self.trainer.max_epochs
+        updates_per_epoch = 1 if self.trainer.max_steps > 0 else max(1, steps // epochs)
+        if self.trainer.max_steps > 0:
+            epochs = steps
+        warmup_budget = round(epochs * 30 / 500) if self.trainer.max_steps > 0 else 30
+        warmup_epochs = 0 if epochs == 1 else max(1, min(epochs - 1, warmup_budget))
+        self.optim["scheduler"] = partial(
+            torch.optim.lr_scheduler.LambdaLR,
+            lr_lambda=partial(
+                _reference_lr_multiplier,
+                updates_per_epoch=updates_per_epoch,
+                max_epochs=epochs,
+                warmup_epochs=warmup_epochs,
+                base_lr=self.hparams.lr,
+            ),
+        )
         return super().configure_optimizers()

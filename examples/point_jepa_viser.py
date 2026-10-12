@@ -15,13 +15,12 @@ import time
 
 import numpy as np
 import torch
+
+import stable_pretraining as spt
 import viser
 
-from stable_pretraining.data.point_cloud import ShapeNet55
-from stable_pretraining.methods.point_jepa import PointJEPA
 
-
-def load_model(checkpoint_path: Path, device: torch.device) -> PointJEPA:
+def load_model(checkpoint_path: Path, device: torch.device) -> spt.PointJEPA:
     """Restore the Point-JEPA student from an SPT Lightning checkpoint.
 
     Args:
@@ -33,7 +32,7 @@ def load_model(checkpoint_path: Path, device: torch.device) -> PointJEPA:
     """
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     hparams = checkpoint["hyper_parameters"]
-    model = PointJEPA(
+    model = spt.PointJEPA(
         **{
             name: hparams[name]
             for name in (
@@ -76,9 +75,9 @@ def pca_rgb(latents: np.ndarray) -> np.ndarray:
 
 @torch.inference_mode()
 def infer_shape(
-    dataset: ShapeNet55,
+    dataset: spt.data.ShapeNet55,
     index: int,
-    model: PointJEPA,
+    model: spt.PointJEPA,
     device: torch.device,
     rng: np.random.Generator,
     num_points: int = 1024,
@@ -97,16 +96,22 @@ def infer_shape(
         Normalized full-cloud positions [N,3], uint8 colors [N,3], and object ID.
     """
     raw = dataset[index]["points"]
-    selected = torch.from_numpy(rng.choice(len(raw), size=num_points, replace=False))
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(int(rng.integers(0, 2**31)))
+        selected = spt.backbone.farthest_point_indices(raw.unsqueeze(0), num_points)[0]
     sample = raw[selected]
     center = sample.mean(dim=0)
-    radius = (sample - center).norm(dim=-1).max().clamp_min(1e-8)
+    radius = (sample - center).norm(dim=-1).max()
     points = (raw - center) / radius
     sample = points[selected].unsqueeze(0).to(device)
 
     tokens, centers = model.tokenizer(sample)
-    tokens, centers = model.sequencer(tokens, centers)
-    latents = model.encoder.forward_student(tokens, centers)[0].float().cpu().numpy()
+    latents = (
+        model.encoder.forward_student(tokens, model.encoder_position(centers))[0]
+        .float()
+        .cpu()
+        .numpy()
+    )
     patch_colors = pca_rgb(latents)
 
     centers_cpu = centers[0].float().cpu()
@@ -121,7 +126,9 @@ def main() -> None:
     """Serve an interactive point cloud with a random-shape button."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--archive", type=Path, default=Path("POINT_JEPA_DEV/data/ShapeNet55.zip")
+        "--archive",
+        type=Path,
+        default=Path("POINT_JEPA_DEV/data/ShapeNet55.zip"),
     )
     parser.add_argument(
         "--checkpoint", type=Path, default=Path("POINT_JEPA_DEV/mini_run.ckpt")
@@ -138,7 +145,7 @@ def main() -> None:
         device_name = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(device_name)
     model = load_model(args.checkpoint, device)
-    dataset = ShapeNet55(args.archive)
+    dataset = spt.data.ShapeNet55(args.archive)
     rng = np.random.default_rng(args.seed)
     current_index = int(rng.integers(len(dataset)))
     points, colors, object_id = infer_shape(dataset, current_index, model, device, rng)
