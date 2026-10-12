@@ -87,7 +87,43 @@ def test_point_jepa_forward_backward():
         predictor_depth=1,
         predictor_heads=3,
     )
+    masks, predictor_inputs, student_inputs, teacher_inputs = [], [], [], []
+    handles = [
+        model.masking.register_forward_hook(
+            lambda module, args, output: masks.append(output)
+        ),
+        model.predictor.register_forward_pre_hook(
+            lambda module, args, kwargs: predictor_inputs.append(kwargs),
+            with_kwargs=True,
+        ),
+        model.encoder.student.register_forward_pre_hook(
+            lambda module, args: student_inputs.append(args)
+        ),
+        model.encoder.teacher.register_forward_pre_hook(
+            lambda module, args: teacher_inputs.append(args)
+        ),
+    ]
     output = model({"points": torch.randn(2, 64, 3)}, "fit")
+    for handle in handles:
+        handle.remove()
+    mask = masks[0]
+    assert len(student_inputs) == len(teacher_inputs) == 1
+    assert teacher_inputs[0][0].shape == (2, 8, 48)
+    torch.testing.assert_close(
+        student_inputs[0][0], teacher_inputs[0][0][:, mask.context_idx]
+    )
+    torch.testing.assert_close(
+        student_inputs[0][1], teacher_inputs[0][1][:, mask.context_idx]
+    )
+    assert len(predictor_inputs) == 4
+    for inputs, target_idx in zip(predictor_inputs, mask.target_idx):
+        assert inputs["queries"].shape == (2, target_idx.numel(), 48)
+        assert torch.count_nonzero(inputs["queries"]) == 0
+        assert inputs["query_mask"].all()
+        torch.testing.assert_close(
+            inputs["query_pos"],
+            model.predictor_position(teacher_inputs[0][1][:, target_idx]),
+        )
     assert output["predictions"].shape == output["targets"].shape
     assert torch.isfinite(output["loss"])
     output["loss"].backward()

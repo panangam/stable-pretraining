@@ -2,6 +2,10 @@
 
 `spt.PointJEPA` implements the 64 group, 32 neighbor, 384 width Point-JEPA architecture with a shared PointNet tokenizer, spatial sequencer, EMA teacher encoder, and 192 width predictor. It uses PyTorch FPS/KNN grouping and SPT's `TeacherStudentCallback` and manual optimizer accumulation.
 
+The teacher encodes all patch tokens, while the student encodes only selected context tokens outside the union of targets. Each of the four target blocks is predicted in a separate predictor call using student context features and learned mask tokens with target XYZ positions; queries from different blocks do not attend to each other. Target blocks share a sampled length within each batch, have independent start positions, and may overlap. Predictions are compared with the teacher's encoded target features using Smooth-L1 with beta 2. Downstream evaluation uses all student tokens and concatenates their max and mean pools.
+
+The shared target length matches the official implementation. See [the reference comparison](point_jepa_reference_comparison.md) for verified matches, SPT integration changes, and remaining numerical differences, including encoder position ownership, teacher target normalization, preprocessing, and EMA scheduling. This implementation is not yet numerically equivalent to the released code.
+
 ## Short ShapeNet smoke run
 
 The development script reads the ZIP archive without extraction and uses 16 objects by default; it does not require the official split metadata.
