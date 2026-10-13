@@ -111,7 +111,11 @@ class PointTokenizer(nn.Module):
 
 
 class PointSequencer(nn.Module):
-    """Order centers by a greedy nearest-neighbor walk from minimum XYZ sum."""
+    """Order point-cloud patches along a greedy spatial nearest-neighbor walk.
+
+    Starts at the center with minimum XYZ sum and reorders tokens and centers
+    together, making contiguous token intervals spatially local for JEPA masking.
+    """
 
     def forward(
         self, tokens: torch.Tensor, centers: torch.Tensor
@@ -147,7 +151,11 @@ class PointSequencer(nn.Module):
 
 @dataclass
 class PointJEPAMaskOutput:
-    """Indices shared across a batch, with target-block boundaries preserved."""
+    """Point-JEPA patch indices shared across a batch.
+
+    ``context_idx`` has shape [C]; ``target_idx`` has shape [num_targets,T],
+    preserving the boundaries of independently predicted target blocks.
+    """
 
     context_idx: torch.Tensor
     target_idx: torch.Tensor
@@ -155,6 +163,9 @@ class PointJEPAMaskOutput:
 
 class PointJEPAMasking(nn.Module):
     """Sample overlapping contiguous targets and target-free filtered context.
+
+    Operates on spatially sequenced point-cloud patches. Target blocks share a
+    sampled length; context excludes every target patch before sampling an interval.
 
     Args:
         num_targets: Number of target intervals.
@@ -199,7 +210,10 @@ class PointJEPAMasking(nn.Module):
 
 
 class PointTokenTransformer(nn.Module):
-    """Transformer encoder that adds learned XYZ positions at every block.
+    """Point-cloud patch transformer with XYZ position embeddings at every block.
+
+    Accepts patch tokens and externally encoded XYZ positions of matching width.
+    Uses the same transformer blocks as ViT without assuming a regular patch grid.
 
     Args:
         embed_dim: Token width.

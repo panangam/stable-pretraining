@@ -70,7 +70,11 @@ def _reference_lr_multiplier(
 
 
 class PointJEPA(Module):
-    """Point-JEPA with shared tokenizer and EMA teacher transformer.
+    """Point-JEPA: joint-embedding predictive learning for XYZ point clouds.
+
+    Processes batches containing ``points`` tensors of shape [B,N,3]. A shared
+    PointNet tokenizer embeds local patches, and a transformer predicts masked
+    patch features from an EMA teacher using visible context and XYZ positions.
 
     Args:
         num_groups: FPS patch centers.
