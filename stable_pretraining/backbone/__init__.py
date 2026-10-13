@@ -1,6 +1,6 @@
 from .convmixer import ConvMixer
-from .._point_cloud import farthest_point_indices
 from .point_cloud import (
+    farthest_point_indices,
     PointJEPAMasking,
     PointJEPAMaskOutput,
     PointSequencer,

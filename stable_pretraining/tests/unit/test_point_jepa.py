@@ -1,9 +1,5 @@
 """Point-JEPA point-cloud primitives and latent-prediction contracts."""
 
-import io
-import zipfile
-
-import numpy as np
 import torch
 
 from stable_pretraining.backbone.point_cloud import (
@@ -16,7 +12,7 @@ from stable_pretraining.methods.point_jepa import (
     _PointJEPAEMA,
     _reference_lr_multiplier,
 )
-from stable_pretraining.data.point_cloud import PointCloudTransform, ShapeNet55
+from stable_pretraining.data.point_cloud import PointCloudTransform
 
 
 def test_tokenizer_and_sequencer():
@@ -152,23 +148,6 @@ def test_point_jepa_forward_backward():
     )
 
 
-def test_shapenet_split_uses_official_npy_names(tmp_path):
-    """Official split lines include .npy and select objects from the ZIP."""
-    archive = tmp_path / "ShapeNet55.zip"
-    payload = io.BytesIO()
-    np.save(payload, np.random.randn(64, 3).astype("float32"))
-    with zipfile.ZipFile(archive, "w") as handle:
-        handle.writestr("ShapeNet55/shapenet_pc/object-a.npy", payload.getvalue())
-        handle.writestr("ShapeNet55/shapenet_pc/object-b.npy", payload.getvalue())
-    split = tmp_path / "train.txt"
-    split.write_text("object-a.npy\n")
-    dataset = ShapeNet55(
-        archive, split_file=split, transform=PointCloudTransform(32, False)
-    )
-    assert len(dataset) == 1
-    assert dataset[0]["points"].shape == (32, 3)
-
-
 def test_reference_ema_updates_and_resume():
     """Initial copies and subsequent linear EMA survive state restoration."""
     student = torch.nn.Linear(3, 4)
@@ -223,7 +202,7 @@ def test_batched_point_transform_fps_and_shared_augmentation():
     torch.testing.assert_close(
         batch["points"].norm(dim=-1).max(1).values, torch.ones(2)
     )
-    from stable_pretraining._point_cloud import farthest_point_indices
+    from stable_pretraining.backbone.point_cloud import farthest_point_indices
 
     indices = farthest_point_indices(repeated, 32)
     assert indices.shape == (2, 32)

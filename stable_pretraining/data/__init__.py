@@ -7,7 +7,7 @@ and other data-related functionality for the stable-pretraining framework.
 from . import dataset_stats, gpu_transforms, sampler, synthetic_data, transforms
 from .collate import Collator
 from .datasets import Dataset, FromTorchDataset, HFDataset, Subset
-from .point_cloud import ModelNet40H5, PointCloudTransform, ShapeNet55
+from .point_cloud import PointCloudTransform
 from .gpu_transforms import GPUCompose, MultiView, StackedMultiView, ToDevice
 from .download import bulk_download, download
 from .module import DataModule
@@ -62,8 +62,6 @@ __all__ = [
     "Collator",
     "Dataset",
     "PointCloudTransform",
-    "ShapeNet55",
-    "ModelNet40H5",
     # GPU-side transforms (ToDevice + GPUCompose + view fan-out wrappers
     # are kornia-free; the kornia-backed ops live in ``gpu_transforms``
     # submodule)

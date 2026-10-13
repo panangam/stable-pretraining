@@ -1582,7 +1582,9 @@ class FlexibleTransformer(nn.Module):
             Only applies to joint attention mode (cross_attn=False).
             The mask is automatically expanded to account for registers.
         :param context_pos: Explicit context position embeddings [B, N_ctx, hidden_dim].
+            If None, use context_idx with generated grid-based positional embeddings.
         :param query_pos: Explicit query position embeddings [B, N_qry, hidden_dim].
+            If None, use query_idx with generated grid-based positional embeddings.
         :return: Output embeddings. Shape depends on mode:
             - cross_attn=True: [B, N_qry, output_dim]
             - cross_attn=False, return_all=False: [B, N_qry, output_dim]
