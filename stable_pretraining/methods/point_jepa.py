@@ -115,6 +115,7 @@ class PointJEPA(Module):
             tokenizer=PointTokenizer(num_groups, group_size, embed_dim),
             sequencer=PointSequencer(),
             masking=PointJEPAMasking(),
+            # use custom EMA scheduling to match official implementation
             encoder=_PointJEPAEMA(encoder, ema_decay_start, ema_decay_end),
             encoder_position=nn.Sequential(
                 nn.Linear(3, 128), nn.GELU(), nn.Linear(128, embed_dim)
